@@ -4,6 +4,8 @@
 [![Claude Code](https://img.shields.io/badge/Powered%20by-Claude%20Code-orange?style=for-the-badge)](https://claude.ai/code)
 [![TypeScript](https://img.shields.io/badge/Built%20with-TypeScript-3178C6?style=for-the-badge&logo=typescript)](https://www.typescriptlang.org/)
 
+🔔 Notify Sound — Optional notification sound for incoming Claude responses (configurable in extension settings).
+
 > **No more terminal commands. Chat with Claude Code through a beautiful, intuitive interface right inside VS Code.**
 
 Ditch the command line and experience Claude Code like never before. This extension brings a stunning chat interface directly into your editor, making AI assistance accessible, visual, and enjoyable.
