@@ -2714,6 +2714,7 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 			const wslNodePath = document.getElementById('wsl-node-path').value;
 			const wslClaudePath = document.getElementById('wsl-claude-path').value;
 			const yoloMode = document.getElementById('yolo-mode').checked;
+			const windowsSound = document.getElementById('windows-sound').checked;
 
 			// Update WSL options visibility
 			document.getElementById('wslOptions').style.display = wslEnabled ? 'block' : 'none';
@@ -2726,7 +2727,8 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 					'wsl.distro': wslDistro || 'Ubuntu',
 					'wsl.nodePath': wslNodePath || '/usr/bin/node',
 					'wsl.claudePath': wslClaudePath || '/usr/local/bin/claude',
-					'permissions.yoloMode': yoloMode
+					'permissions.yoloMode': yoloMode,
+					'notifications.windowsSound': windowsSound
 				}
 			});
 		}
@@ -2935,6 +2937,7 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 				document.getElementById('wsl-node-path').value = message.data['wsl.nodePath'] || '/usr/bin/node';
 				document.getElementById('wsl-claude-path').value = message.data['wsl.claudePath'] || '/usr/local/bin/claude';
 				document.getElementById('yolo-mode').checked = message.data['permissions.yoloMode'] || false;
+				document.getElementById('windows-sound').checked = message.data['notifications.windowsSound'] || false;
 				
 				// Update yolo warning visibility
 				updateYoloWarning();

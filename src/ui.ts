@@ -347,6 +347,19 @@ const getHtml = (isTelemetryEnabled: boolean) => `<!DOCTYPE html>
 					</div>
 				</div>
 
+				<h3 style="margin-top: 20px; margin-bottom: 16px; font-size: 14px; font-weight: 600;">Notifications</h3>
+				<div>
+					<p style="font-size: 11px; color: var(--vscode-descriptionForeground); margin: 0;">
+						Configure notification preferences when Claude completes responses.
+					</p>
+				</div>
+				<div class="settings-group">
+					<div class="tool-item">
+						<input type="checkbox" id="windows-sound" onchange="updateSettings()">
+						<label for="windows-sound">Play Windows notification sound when Claude completes a response</label>
+					</div>
+				</div>
+
 				
 			</div>
 		</div>

@@ -804,6 +804,9 @@ class ClaudeChatProvider {
 
 					this._isProcessing = false;
 
+					// Play Windows notification sound when Claude completes a response
+					void this._playWindowsNotificationSound();
+
 					// Capture session ID from final result
 					if (jsonData.session_id) {
 						const isNewSession = !this._currentSessionId;
@@ -2147,7 +2150,8 @@ class ClaudeChatProvider {
 			'wsl.distro': config.get<string>('wsl.distro', 'Ubuntu'),
 			'wsl.nodePath': config.get<string>('wsl.nodePath', '/usr/bin/node'),
 			'wsl.claudePath': config.get<string>('wsl.claudePath', '/usr/local/bin/claude'),
-			'permissions.yoloMode': config.get<boolean>('permissions.yoloMode', false)
+			'permissions.yoloMode': config.get<boolean>('permissions.yoloMode', false),
+			'notifications.windowsSound': config.get<boolean>('notifications.windowsSound', false)
 		};
 
 		this._postMessage({
@@ -2178,6 +2182,41 @@ class ClaudeChatProvider {
 		this._draftMessage = text || '';
 	}
 
+	private async _playWindowsNotificationSound(): Promise<void> {
+		try {
+			// Only play sound on Windows platform
+			if (process.platform !== 'win32') {
+				return;
+			}
+
+			// Check if Windows notification sound is enabled
+			const config = vscode.workspace.getConfiguration('claudeCodeChat');
+			const soundEnabled = config.get<boolean>('notifications.windowsSound', false);
+			
+			if (!soundEnabled) {
+				return;
+			}
+
+			// Try to play Windows Generic notification sound
+			try {
+				const command = 'powershell.exe -Command "(New-Object Media.SoundPlayer \\"C:\\Windows\\Media\\Windows Notify System Generic.wav\\").PlaySync()"';
+				await exec(command);
+			} catch (error1: any) {
+				// Fallback to alternative Windows notification sound
+				try {
+					const fallbackCommand = 'rundll32 user32.dll,MessageBeep 64';
+					await exec(fallbackCommand);
+				} catch (error2: any) {
+					// Silent fail - don't interrupt user workflow
+					console.log('Windows notification sound failed to play');
+				}
+			}
+		} catch (error: any) {
+			// Silent fail - don't interrupt user workflow
+			console.log('Windows notification sound error:', error.message);
+		}
+	}
+
 	private async _updateSettings(settings: { [key: string]: any }): Promise<void> {
 		const config = vscode.workspace.getConfiguration('claudeCodeChat');
 
@@ -2185,6 +2224,9 @@ class ClaudeChatProvider {
 			for (const [key, value] of Object.entries(settings)) {
 				if (key === 'permissions.yoloMode') {
 					// YOLO mode is workspace-specific
+					await config.update(key, value, vscode.ConfigurationTarget.Workspace);
+				} else if (key === 'notifications.windowsSound') {
+					// Windows sound notification is workspace-specific
 					await config.update(key, value, vscode.ConfigurationTarget.Workspace);
 				} else {
 					// Other settings are global (user-wide)

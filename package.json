@@ -185,6 +185,11 @@
           "type": "boolean",
           "default": false,
           "description": "Enable Yolo Mode to skip all permission checks. Use with caution as Claude can execute any command without asking."
+        },
+        "claudeCodeChat.notifications.windowsSound": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Windows system notification sound when Claude completes a response"
         }
       }
     }
