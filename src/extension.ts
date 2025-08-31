@@ -2151,7 +2151,8 @@ class ClaudeChatProvider {
 			'wsl.nodePath': config.get<string>('wsl.nodePath', '/usr/bin/node'),
 			'wsl.claudePath': config.get<string>('wsl.claudePath', '/usr/local/bin/claude'),
 			'permissions.yoloMode': config.get<boolean>('permissions.yoloMode', false),
-			'notifications.windowsSound': config.get<boolean>('notifications.windowsSound', false)
+			'notifications.windowsSound': config.get<boolean>('notifications.windowsSound', false),
+			'notifications.customSoundPath': config.get<string>('notifications.customSoundPath', '')
 		};
 
 		this._postMessage({
@@ -2197,7 +2198,64 @@ class ClaudeChatProvider {
 				return;
 			}
 
-			// Try to play Windows Generic notification sound
+			// Get custom sound path if specified
+			const customSoundPath = config.get<string>('notifications.customSoundPath', '').trim();
+
+			if (customSoundPath) {
+				console.log('Attempting to play custom sound:', customSoundPath);
+				
+				// First check if file exists
+				try {
+					const checkFileCommand = `powershell.exe -Command "Test-Path '${customSoundPath}'"`;
+					const fileExists = await exec(checkFileCommand);
+					console.log('File exists check result:', fileExists.stdout.trim());
+					
+					if (fileExists.stdout.trim() !== 'True') {
+						console.log('Custom sound file does not exist at path:', customSoundPath);
+						// Continue to default sound
+					} else {
+						console.log('Custom sound file exists, proceeding to play');
+					}
+				} catch (checkError: any) {
+					console.log('File existence check failed:', checkError.message);
+				}
+				
+				// Treat custom sound as WAV only: use SoundPlayer as primary method and keep fallbacks
+				try {
+					const wavCommand = `powershell.exe -Command "(New-Object Media.SoundPlayer \\\"${customSoundPath}\\\").PlaySync()"`;
+					console.log('Playing WAV with SoundPlayer:', wavCommand);
+					await exec(wavCommand);
+					console.log('WAV played successfully with SoundPlayer');
+					return;
+				} catch (customError: any) {
+					console.log('Primary WAV method failed:', customError.message);
+				
+					// Fallback: mshta.exe with HTML5 audio (may handle WAV files)
+					try {
+						const htmlAudioCommand = `mshta "javascript:var audio=new Audio('file:///${customSoundPath.replace(/\\/g, '/') }');audio.play();setTimeout(function(){window.close();},2000);void(0);"`;
+						console.log('Trying HTML5 audio method:', htmlAudioCommand);
+						await exec(htmlAudioCommand);
+						console.log('Custom WAV played with HTML5 audio successfully');
+						return;
+					} catch (altError: any) {
+						console.log('HTML5 audio method failed:', altError.message);
+					
+						// Final fallback: PowerShell with System.Windows.Media.MediaPlayer
+						try {
+							const correctNamespaceCommand = `powershell.exe -Command "Add-Type -AssemblyName PresentationCore; $player = New-Object System.Windows.Media.MediaPlayer; $player.Open([System.Uri]'${customSoundPath}'); $player.Play(); Start-Sleep -Seconds 2"`;
+							console.log('Trying System.Windows.Media.MediaPlayer:', correctNamespaceCommand);
+							await exec(correctNamespaceCommand);
+							console.log('Custom sound played with System.Windows.Media.MediaPlayer');
+							return;
+						} catch (finalError: any) {
+							console.log('All custom sound methods failed, falling back to default');
+							// Continue to default sound as fallback
+						}
+					}
+				}
+			}
+
+			// Try to play Windows Generic notification sound (default)
 			try {
 				const command = 'powershell.exe -Command "(New-Object Media.SoundPlayer \\"C:\\Windows\\Media\\Windows Notify System Generic.wav\\").PlaySync()"';
 				await exec(command);
@@ -2225,8 +2283,8 @@ class ClaudeChatProvider {
 				if (key === 'permissions.yoloMode') {
 					// YOLO mode is workspace-specific
 					await config.update(key, value, vscode.ConfigurationTarget.Workspace);
-				} else if (key === 'notifications.windowsSound') {
-					// Windows sound notification is workspace-specific
+				} else if (key === 'notifications.windowsSound' || key === 'notifications.customSoundPath') {
+					// Windows sound notification settings are workspace-specific
 					await config.update(key, value, vscode.ConfigurationTarget.Workspace);
 				} else {
 					// Other settings are global (user-wide)

@@ -2715,6 +2715,7 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 			const wslClaudePath = document.getElementById('wsl-claude-path').value;
 			const yoloMode = document.getElementById('yolo-mode').checked;
 			const windowsSound = document.getElementById('windows-sound').checked;
+			const customSoundPath = document.getElementById('custom-sound-path').value;
 
 			// Update WSL options visibility
 			document.getElementById('wslOptions').style.display = wslEnabled ? 'block' : 'none';
@@ -2728,7 +2729,8 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 					'wsl.nodePath': wslNodePath || '/usr/bin/node',
 					'wsl.claudePath': wslClaudePath || '/usr/local/bin/claude',
 					'permissions.yoloMode': yoloMode,
-					'notifications.windowsSound': windowsSound
+					'notifications.windowsSound': windowsSound,
+					'notifications.customSoundPath': customSoundPath || ''
 				}
 			});
 		}
@@ -2938,6 +2940,7 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 				document.getElementById('wsl-claude-path').value = message.data['wsl.claudePath'] || '/usr/local/bin/claude';
 				document.getElementById('yolo-mode').checked = message.data['permissions.yoloMode'] || false;
 				document.getElementById('windows-sound').checked = message.data['notifications.windowsSound'] || false;
+				document.getElementById('custom-sound-path').value = message.data['notifications.customSoundPath'] || '';
 				
 				// Update yolo warning visibility
 				updateYoloWarning();

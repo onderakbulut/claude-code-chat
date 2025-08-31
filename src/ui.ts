@@ -358,6 +358,13 @@ const getHtml = (isTelemetryEnabled: boolean) => `<!DOCTYPE html>
 						<input type="checkbox" id="windows-sound" onchange="updateSettings()">
 						<label for="windows-sound">Play Windows notification sound when Claude completes a response</label>
 					</div>
+					<div style="margin-left: 24px; margin-top: 12px;">
+						<label style="display: block; margin-bottom: 4px; font-size: 12px; color: var(--vscode-descriptionForeground);">Custom Sound File Path (optional)</label>
+						<input type="text" id="custom-sound-path" class="file-search-input" style="width: 100%;" placeholder="C:/Windows/Media/custom.wav" onchange="updateSettings()">
+						<p style="font-size: 10px; color: var(--vscode-descriptionForeground); margin: 4px 0 0 0;">
+							Leave empty to use default Windows Generic sound. Supports .wav files.
+						</p>
+					</div>
 				</div>
 
 				

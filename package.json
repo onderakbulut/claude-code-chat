@@ -190,6 +190,11 @@
           "type": "boolean",
           "default": false,
           "description": "Enable Windows system notification sound when Claude completes a response"
+        },
+        "claudeCodeChat.notifications.customSoundPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to custom sound file to play when Claude completes a response (e.g., C:/Windows/Media/custom.wav)"
         }
       }
     }
