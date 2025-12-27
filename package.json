@@ -57,6 +57,11 @@
         "title": "Open Claude Code Chat",
         "category": "Claude Code Chat",
         "icon": "icon-bubble.png"
+      },
+      {
+        "command": "claude-code-chat.addToChat",
+        "title": "Add to Claude Chat",
+        "category": "Claude Code Chat"
       }
     ],
     "keybindings": [
@@ -96,6 +101,11 @@
         {
           "command": "claude-code-chat.openChat",
           "group": "claude@1"
+        },
+        {
+          "command": "claude-code-chat.addToChat",
+          "group": "claude@2",
+          "when": "!explorerResourceIsRoot"
         }
       ],
       "scm/title": [

@@ -30,6 +30,12 @@ export function activate(context: vscode.ExtensionContext) {
 		provider.loadConversation(filename);
 	});
 
+	const addToChatDisposable = vscode.commands.registerCommand('claude-code-chat.addToChat', (uri: vscode.Uri, selectedUris: vscode.Uri[]) => {
+		// If multiple items selected in explorer, use selectedUris, otherwise use single uri
+		const uris = selectedUris && selectedUris.length > 0 ? selectedUris : [uri];
+		provider.addFilesToChat(uris);
+	});
+
 	// Register webview view provider for sidebar chat (using shared provider instance)
 	const webviewProvider = new ClaudeChatWebviewProvider(context.extensionUri, context, provider);
 	vscode.window.registerWebviewViewProvider('claude-code-chat.chat', webviewProvider);
@@ -53,7 +59,7 @@ export function activate(context: vscode.ExtensionContext) {
 	statusBarItem.command = 'claude-code-chat.openChat';
 	statusBarItem.show();
 
-	context.subscriptions.push(disposable, loadConversationDisposable, configChangeDisposable, statusBarItem);
+	context.subscriptions.push(disposable, loadConversationDisposable, addToChatDisposable, configChangeDisposable, statusBarItem);
 	console.log('Claude Code Chat extension activation completed successfully!');
 }
 
@@ -197,7 +203,8 @@ class ClaudeChatProvider {
 			{
 				enableScripts: true,
 				retainContextWhenHidden: true,
-				localResourceRoots: [this._extensionUri]
+				localResourceRoots: [this._extensionUri],
+				enableFindWidget: true
 			}
 		);
 
@@ -3114,6 +3121,74 @@ class ClaudeChatProvider {
 		} catch (error) {
 			console.error('Error creating image file:', error);
 			vscode.window.showErrorMessage('Failed to create image file');
+		}
+	}
+
+	public async addFilesToChat(uris: vscode.Uri[]): Promise<void> {
+		console.log('addFilesToChat called with', uris.length, 'URIs');
+
+		// Ensure chat panel is open
+		this.show();
+
+		// Wait for panel to be ready
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		try {
+			const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+			if (!workspaceFolder) {
+				vscode.window.showErrorMessage('No workspace folder open');
+				return;
+			}
+
+			const fileReferences: string[] = [];
+			const errors: string[] = [];
+
+			for (const uri of uris) {
+				try {
+					// Check if path is within workspace
+					const relativePath = vscode.workspace.asRelativePath(uri, false);
+
+					// If relativePath is still absolute, it's outside workspace
+					if (path.isAbsolute(relativePath)) {
+						errors.push(`${path.basename(uri.fsPath)} is outside workspace`);
+						continue;
+					}
+
+					// Check if path exists
+					try {
+						await vscode.workspace.fs.stat(uri);
+						// Add @ prefix for file reference
+						fileReferences.push(`@${relativePath}`);
+					} catch (statError) {
+						errors.push(`${path.basename(uri.fsPath)} does not exist`);
+						continue;
+					}
+
+				} catch (error) {
+					errors.push(`Failed to process ${path.basename(uri.fsPath)}`);
+					console.error('Error processing path:', error);
+				}
+			}
+
+			// Show errors if any
+			if (errors.length > 0) {
+				vscode.window.showWarningMessage(
+					`Some items could not be added: ${errors.join(', ')}`
+				);
+			}
+
+			// Send file references to webview to add to textarea
+			if (fileReferences.length > 0) {
+				console.log('Sending file references to webview:', fileReferences);
+				this._postMessage({
+					type: 'addFilesToInput',
+					files: fileReferences
+				});
+			}
+
+		} catch (error) {
+			console.error('Error in addFilesToChat:', error);
+			vscode.window.showErrorMessage('Failed to add files to chat');
 		}
 	}
 

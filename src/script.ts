@@ -2347,7 +2347,18 @@ const getScript = (isTelemetryEnabled: boolean) => `<script>
 					messageInput.focus();
 					adjustTextareaHeight();
 					break;
-					
+
+				case 'addFilesToInput':
+					// Add file references to the textarea
+					console.log('Received addFilesToInput:', message.files);
+					const fileRefs = message.files.join(' ');
+					const existingText = messageInput.value;
+					const spaceBefore = existingText && !existingText.endsWith(' ') ? ' ' : '';
+					messageInput.value = existingText + spaceBefore + fileRefs + ' ';
+					messageInput.focus();
+					adjustTextareaHeight();
+					break;
+
 				case 'conversationList':
 					displayConversationList(message.data);
 					break;
