@@ -6,6 +6,17 @@ import getHtml from './ui';
 
 const exec = util.promisify(cp.exec);
 
+// Storage for diff content (used by DiffContentProvider)
+const diffContentStore = new Map<string, string>();
+
+// Custom TextDocumentContentProvider for read-only diff views
+class DiffContentProvider implements vscode.TextDocumentContentProvider {
+	provideTextDocumentContent(uri: vscode.Uri): string {
+		const content = diffContentStore.get(uri.path);
+		return content || '';
+	}
+}
+
 export function activate(context: vscode.ExtensionContext) {
 	console.log('Claude Code Chat extension is being activated!');
 	const provider = new ClaudeChatProvider(context.extensionUri, context);
@@ -22,6 +33,10 @@ export function activate(context: vscode.ExtensionContext) {
 	// Register webview view provider for sidebar chat (using shared provider instance)
 	const webviewProvider = new ClaudeChatWebviewProvider(context.extensionUri, context, provider);
 	vscode.window.registerWebviewViewProvider('claude-code-chat.chat', webviewProvider);
+
+	// Register custom content provider for read-only diff views
+	const diffProvider = new DiffContentProvider();
+	context.subscriptions.push(vscode.workspace.registerTextDocumentContentProvider('claude-diff', diffProvider));
 
 	// Listen for configuration changes
 	const configChangeDisposable = vscode.workspace.onDidChangeConfiguration(event => {
@@ -105,13 +120,20 @@ class ClaudeChatProvider {
 	private _totalTokensInput: number = 0;
 	private _totalTokensOutput: number = 0;
 	private _requestCount: number = 0;
+	private _subscriptionType: string | undefined;  // 'pro', 'max', or undefined for API users
+	private _accountInfoFetchedThisSession: boolean = false;  // Track if we fetched account info this session
 	private _currentSessionId: string | undefined;
 	private _backupRepoPath: string | undefined;
 	private _commits: Array<{ id: string, sha: string, message: string, timestamp: string }> = [];
 	private _conversationsPath: string | undefined;
-	private _permissionRequestsPath: string | undefined;
-	private _permissionWatcher: vscode.FileSystemWatcher | undefined;
-	private _pendingPermissionResolvers: Map<string, (approved: boolean) => void> | undefined;
+	// Pending permission requests from stdio control_request messages
+	private _pendingPermissionRequests: Map<string, {
+		requestId: string;
+		toolName: string;
+		input: Record<string, unknown>;
+		suggestions?: any[];
+		toolUseId: string;
+	}> = new Map();
 	private _currentConversation: Array<{ timestamp: string, messageType: string, data: any }> = [];
 	private _conversationStartTime: string | undefined;
 	private _conversationIndex: Array<{
@@ -125,6 +147,9 @@ class ClaudeChatProvider {
 		lastUserMessage: string
 	}> = [];
 	private _currentClaudeProcess: cp.ChildProcess | undefined;
+	private _abortController: AbortController | undefined;
+	private _isWslProcess: boolean = false;
+	private _wslDistro: string = 'Ubuntu';
 	private _selectedModel: string = 'default'; // Default model
 	private _isProcessing: boolean | undefined;
 	private _draftMessage: string = '';
@@ -144,6 +169,9 @@ class ClaudeChatProvider {
 
 		// Load saved model preference
 		this._selectedModel = this._context.workspaceState.get('claude.selectedModel', 'default');
+
+		// Load cached subscription type (will be refreshed on first message)
+		this._subscriptionType = this._context.globalState.get('claude.subscriptionType');
 
 		// Resume session from latest conversation
 		const latestConversation = this._getLatestConversation();
@@ -232,6 +260,16 @@ class ClaudeChatProvider {
 			model: this._selectedModel
 		});
 
+		// Send cached subscription type to webview (will be refreshed on first message)
+		if (this._subscriptionType) {
+			this._postMessage({
+				type: 'accountInfo',
+				data: {
+					subscriptionType: this._subscriptionType
+				}
+			});
+		}
+
 		// Send platform information to webview
 		this._sendPlatformInfo();
 
@@ -288,14 +326,26 @@ class ClaudeChatProvider {
 			case 'openModelTerminal':
 				this._openModelTerminal();
 				return;
+			case 'viewUsage':
+				this._openUsageTerminal(message.usageType);
+				return;
 			case 'executeSlashCommand':
 				this._executeSlashCommand(message.command);
 				return;
 			case 'dismissWSLAlert':
 				this._dismissWSLAlert();
 				return;
+			case 'runInstallCommand':
+				this._runInstallCommand();
+				return;
 			case 'openFile':
 				this._openFileInEditor(message.filePath);
+				return;
+			case 'openDiff':
+				this._openDiffEditor(message.oldContent, message.newContent, message.filePath);
+				return;
+			case 'openDiffByIndex':
+				this._openDiffByMessageIndex(message.messageIndex);
 				return;
 			case 'createImageFile':
 				this._createImageFile(message.imageData, message.imageType);
@@ -413,11 +463,8 @@ class ClaudeChatProvider {
 		const configThink = vscode.workspace.getConfiguration('claudeCodeChat');
 		const thinkingIntensity = configThink.get<string>('thinking.intensity', 'think');
 
-		// Prepend mode instructions if enabled
+		// Prepend thinking mode instructions if enabled
 		let actualMessage = message;
-		if (planMode) {
-			actualMessage = 'PLAN FIRST FOR THIS MESSAGE ONLY: Plan first before making any changes. Show me in detail what you will change and wait for my explicit approval in a separate message before proceeding. Do not implement anything until I confirm. This planning requirement applies ONLY to this current message. \n\n' + message;
-		}
 		if (thinkingMode) {
 			let thinkingPrompt = '';
 			const thinkingMesssage = ' THROUGH THIS STEP BY STEP: \n'
@@ -472,9 +519,12 @@ class ClaudeChatProvider {
 		});
 
 		// Build command arguments with session management
+		// Use stream-json for both input and output to enable bidirectional communication
+		// This is required for stdio-based permission prompts
 		const args = [
-			'-p',
-			'--output-format', 'stream-json', '--verbose'
+			'--output-format', 'stream-json',
+			'--input-format', 'stream-json',
+			'--verbose'
 		];
 
 		// Get configuration
@@ -482,16 +532,22 @@ class ClaudeChatProvider {
 		const yoloMode = config.get<boolean>('permissions.yoloMode', false);
 
 		if (yoloMode) {
-			// Yolo mode: skip all permissions regardless of MCP config
+			// Yolo mode: skip all permissions
 			args.push('--dangerously-skip-permissions');
 		} else {
-			// Add MCP configuration for permissions
-			const mcpConfigPath = this.getMCPConfigPath();
-			if (mcpConfigPath) {
-				args.push('--mcp-config', this.convertToWSLPath(mcpConfigPath));
-				args.push('--allowedTools', 'mcp__claude-code-chat-permissions__approval_prompt');
-				args.push('--permission-prompt-tool', 'mcp__claude-code-chat-permissions__approval_prompt');
-			}
+			// Use stdio-based permission prompts (no MCP server needed)
+			args.push('--permission-prompt-tool', 'stdio');
+		}
+
+		// Add MCP config if user has custom servers configured
+		const mcpConfigPath = this.getMCPConfigPath();
+		if (mcpConfigPath) {
+			args.push('--mcp-config', this.convertToWSLPath(mcpConfigPath));
+		}
+
+		// Add plan mode if enabled
+		if (planMode) {
+			args.push('--permission-mode', 'plan');
 		}
 
 		// Add model selection if not using default
@@ -515,12 +571,21 @@ class ClaudeChatProvider {
 
 		let claudeProcess: cp.ChildProcess;
 
+		// Create new AbortController for this request
+		this._abortController = new AbortController();
+
 		if (wslEnabled) {
 			// Use WSL with bash -ic for proper environment loading
 			console.log('Using WSL configuration:', { wslDistro, nodePath, claudePath });
 			const wslCommand = `"${nodePath}" --no-warnings --enable-source-maps "${claudePath}" ${args.join(' ')}`;
 
+			// Track WSL state for proper process termination
+			this._isWslProcess = true;
+			this._wslDistro = wslDistro;
+
 			claudeProcess = cp.spawn('wsl', ['-d', wslDistro, 'bash', '-ic', wslCommand], {
+				signal: this._abortController.signal,
+				detached: process.platform !== 'win32',
 				cwd: cwd,
 				stdio: ['pipe', 'pipe', 'pipe'],
 				env: {
@@ -530,10 +595,15 @@ class ClaudeChatProvider {
 				}
 			});
 		} else {
+			// Not using WSL
+			this._isWslProcess = false;
+
 			// Use native claude command
 			console.log('Using native Claude command');
 			claudeProcess = cp.spawn('claude', args, {
+				signal: this._abortController.signal,
 				shell: process.platform === 'win32',
+				detached: process.platform !== 'win32',
 				cwd: cwd,
 				stdio: ['pipe', 'pipe', 'pipe'],
 				env: {
@@ -547,10 +617,32 @@ class ClaudeChatProvider {
 		// Store process reference for potential termination
 		this._currentClaudeProcess = claudeProcess;
 
-		// Send the message to Claude's stdin (with mode prefixes if enabled)
+		// Send the message to Claude's stdin as JSON (stream-json input format)
+		// Don't end stdin yet - we need to keep it open for permission responses
 		if (claudeProcess.stdin) {
-			claudeProcess.stdin.write(actualMessage + '\n');
-			claudeProcess.stdin.end();
+			// First, send an initialize request to get account info (once per session)
+			if (!this._accountInfoFetchedThisSession) {
+				this._accountInfoFetchedThisSession = true;
+				const initRequest = {
+					type: 'control_request',
+					request_id: 'init-' + Date.now(),
+					request: {
+						subtype: 'initialize'
+					}
+				};
+				claudeProcess.stdin.write(JSON.stringify(initRequest) + '\n');
+			}
+
+			const userMessage = {
+				type: 'user',
+				session_id: this._currentSessionId || '',
+				message: {
+					role: 'user',
+					content: [{ type: 'text', text: actualMessage }]
+				},
+				parent_tool_use_id: null
+			};
+			claudeProcess.stdin.write(JSON.stringify(userMessage) + '\n');
 		}
 
 		let rawOutput = '';
@@ -568,6 +660,28 @@ class ClaudeChatProvider {
 					if (line.trim()) {
 						try {
 							const jsonData = JSON.parse(line.trim());
+
+							// Handle control_request messages (permission requests via stdio)
+							if (jsonData.type === 'control_request') {
+								this._handleControlRequest(jsonData, claudeProcess).catch(err => {
+									console.error('Error handling control request:', err);
+								});
+								continue;
+							}
+
+							// Handle control_response messages (responses to our initialize request)
+							if (jsonData.type === 'control_response') {
+								this._handleControlResponse(jsonData);
+								continue;
+							}
+
+							// Handle result message - end stdin when done
+							if (jsonData.type === 'result') {
+								if (claudeProcess.stdin && !claudeProcess.stdin.destroyed) {
+									claudeProcess.stdin.end();
+								}
+							}
+
 							this._processJsonStreamData(jsonData);
 						} catch (error) {
 							console.log('Failed to parse JSON line:', line, error);
@@ -593,6 +707,9 @@ class ClaudeChatProvider {
 
 			// Clear process reference
 			this._currentClaudeProcess = undefined;
+
+			// Cancel any pending permission requests (process is gone)
+			this._cancelPendingPermissionRequests();
 
 			// Clear loading indicator and set processing to false
 			this._postMessage({
@@ -627,6 +744,9 @@ class ClaudeChatProvider {
 			// Clear process reference
 			this._currentClaudeProcess = undefined;
 
+			// Cancel any pending permission requests (process is gone)
+			this._cancelPendingPermissionRequests();
+
 			this._postMessage({
 				type: 'clearLoading'
 			});
@@ -641,9 +761,8 @@ class ClaudeChatProvider {
 
 			// Check if claude command is not installed
 			if (error.message.includes('ENOENT') || error.message.includes('command not found')) {
-				this._sendAndSaveMessage({
-					type: 'error',
-					data: 'Install claude code first: https://www.anthropic.com/claude-code'
+				this._postMessage({
+					type: 'showInstallModal'
 				});
 			} else {
 				this._sendAndSaveMessage({
@@ -654,7 +773,7 @@ class ClaudeChatProvider {
 		});
 	}
 
-	private _processJsonStreamData(jsonData: any) {
+	private async _processJsonStreamData(jsonData: any) {
 		switch (jsonData.type) {
 			case 'system':
 				if (jsonData.subtype === 'init') {
@@ -670,6 +789,36 @@ class ClaudeChatProvider {
 							sessionId: jsonData.session_id,
 							tools: jsonData.tools || [],
 							mcpServers: jsonData.mcp_servers || []
+						}
+					});
+				} else if (jsonData.subtype === 'status') {
+					// Handle status changes (e.g., compacting)
+					if (jsonData.status === 'compacting') {
+						console.log('Conversation compacting started');
+						this._sendAndSaveMessage({
+							type: 'compacting',
+							data: { isCompacting: true }
+						});
+					} else if (jsonData.status === null) {
+						console.log('Status cleared');
+						this._sendAndSaveMessage({
+							type: 'compacting',
+							data: { isCompacting: false }
+						});
+					}
+				} else if (jsonData.subtype === 'compact_boundary') {
+					// Compact boundary - conversation was compacted, reset token counts
+					console.log('Compact boundary received', jsonData.compact_metadata);
+
+					// Reset tokens since the conversation is now summarized
+					this._totalTokensInput = 0;
+					this._totalTokensOutput = 0;
+
+					this._sendAndSaveMessage({
+						type: 'compactBoundary',
+						data: {
+							trigger: jsonData.compact_metadata?.trigger,
+							preTokens: jsonData.compact_metadata?.pre_tokens
 						}
 					});
 				}
@@ -714,6 +863,7 @@ class ClaudeChatProvider {
 							// Show tool execution with better formatting
 							const toolInfo = `🔧 Executing: ${content.name}`;
 							let toolInput = '';
+							let fileContentBefore: string | undefined;
 
 							if (content.input) {
 								// Special formatting for TodoWrite to make it more readable
@@ -728,6 +878,44 @@ class ClaudeChatProvider {
 									// Send raw input to UI for formatting
 									toolInput = '';
 								}
+
+								// For Edit/MultiEdit/Write, read current file content (before state)
+								if ((content.name === 'Edit' || content.name === 'MultiEdit' || content.name === 'Write') && content.input.file_path) {
+									try {
+										const fileUri = vscode.Uri.file(content.input.file_path);
+										const fileData = await vscode.workspace.fs.readFile(fileUri);
+										fileContentBefore = Buffer.from(fileData).toString('utf8');
+									} catch {
+										// File might not exist yet (for Write), that's ok
+										fileContentBefore = '';
+									}
+								}
+							}
+
+							// Compute startLine(s) while we have the file content
+							let startLine: number | undefined;
+							let startLines: number[] | undefined;
+							if (fileContentBefore !== undefined) {
+								if (content.name === 'Edit' && content.input.old_string) {
+									const position = fileContentBefore.indexOf(content.input.old_string);
+									if (position !== -1) {
+										const textBefore = fileContentBefore.substring(0, position);
+										startLine = (textBefore.match(/\n/g) || []).length + 1;
+									} else {
+										startLine = 1;
+									}
+								} else if (content.name === 'MultiEdit' && content.input.edits) {
+									startLines = content.input.edits.map((edit: any) => {
+										if (edit.old_string) {
+											const position = fileContentBefore!.indexOf(edit.old_string);
+											if (position !== -1) {
+												const textBefore = fileContentBefore!.substring(0, position);
+												return (textBefore.match(/\n/g) || []).length + 1;
+											}
+										}
+										return 1;
+									});
+								}
 							}
 
 							// Show tool use and save to conversation
@@ -737,7 +925,10 @@ class ClaudeChatProvider {
 									toolInfo: toolInfo,
 									toolInput: toolInput,
 									rawInput: content.input,
-									toolName: content.name
+									toolName: content.name,
+									fileContentBefore: fileContentBefore,
+									startLine: startLine,
+									startLines: startLines
 								}
 							});
 						}
@@ -759,13 +950,28 @@ class ClaudeChatProvider {
 
 							const isError = content.is_error || false;
 
-							// Find the last tool use to get the tool name
+							// Find the last tool use to get the tool name, input, and computed startLine
 							const lastToolUse = this._currentConversation[this._currentConversation.length - 1]
 
 							const toolName = lastToolUse?.data?.toolName;
+							const rawInput = lastToolUse?.data?.rawInput;
+							const startLine = lastToolUse?.data?.startLine;
+							const startLines = lastToolUse?.data?.startLines;
 
-							// Don't send tool result for Read and Edit tools unless there's an error
-							if ((toolName === 'Read' || toolName === 'Edit' || toolName === 'TodoWrite' || toolName === 'MultiEdit') && !isError) {
+							// For Edit/MultiEdit/Write, read current file content (after state)
+							let fileContentAfter: string | undefined;
+							if ((toolName === 'Edit' || toolName === 'MultiEdit' || toolName === 'Write') && rawInput?.file_path && !isError) {
+								try {
+									const fileUri = vscode.Uri.file(rawInput.file_path);
+									const fileData = await vscode.workspace.fs.readFile(fileUri);
+									fileContentAfter = Buffer.from(fileData).toString('utf8');
+								} catch {
+									// File read failed, that's ok
+								}
+							}
+
+							// Don't send tool result for Read and TodoWrite tools unless there's an error
+							if ((toolName === 'Read' || toolName === 'TodoWrite') && !isError) {
 								// Still send to UI to hide loading state, but mark it as hidden
 								this._sendAndSaveMessage({
 									type: 'toolResult',
@@ -774,6 +980,7 @@ class ClaudeChatProvider {
 										isError: isError,
 										toolUseId: content.tool_use_id,
 										toolName: toolName,
+										rawInput: rawInput,
 										hidden: true
 									}
 								});
@@ -785,7 +992,11 @@ class ClaudeChatProvider {
 										content: resultContent,
 										isError: isError,
 										toolUseId: content.tool_use_id,
-										toolName: toolName
+										toolName: toolName,
+										rawInput: rawInput,
+										fileContentAfter: fileContentAfter,
+										startLine: startLine,
+										startLines: startLines
 									}
 								});
 							}
@@ -869,9 +1080,8 @@ class ClaudeChatProvider {
 	}
 
 
-	private _newSession() {
-
-		this._isProcessing = false
+	private async _newSession(): Promise<void> {
+		this._isProcessing = false;
 
 		// Update UI state
 		this._postMessage({
@@ -879,12 +1089,8 @@ class ClaudeChatProvider {
 			data: { isProcessing: false }
 		});
 
-		// Try graceful termination first
-		if (this._currentClaudeProcess) {
-			const processToKill = this._currentClaudeProcess;
-			this._currentClaudeProcess = undefined;
-			processToKill.kill('SIGTERM');
-		}
+		// Kill Claude process and all child processes
+		await this._killClaudeProcess();
 
 		// Clear current session
 		this._currentSessionId = undefined;
@@ -949,7 +1155,10 @@ class ClaudeChatProvider {
 		const claudePath = config.get<string>('wsl.claudePath', '/usr/local/bin/claude');
 
 		// Open terminal and run claude login
-		const terminal = vscode.window.createTerminal('Claude Login');
+		const terminal = vscode.window.createTerminal({
+			name: 'Claude Login',
+			location: { viewColumn: vscode.ViewColumn.One }
+		});
 		if (wslEnabled) {
 			terminal.sendText(`wsl -d ${wslDistro} ${nodePath} --no-warnings --enable-source-maps ${claudePath}`);
 		} else {
@@ -959,14 +1168,14 @@ class ClaudeChatProvider {
 
 		// Show info message
 		vscode.window.showInformationMessage(
-			'Please login to Claude in the terminal, then come back to this chat to continue.',
+			'Please login with your Claude plan or API key in the terminal, then come back to this chat.',
 			'OK'
 		);
 
 		// Send message to UI about terminal
 		this._postMessage({
 			type: 'terminalOpened',
-			data: `Please login to Claude in the terminal, then come back to this chat to continue.`,
+			data: `Please login with your Claude plan or API key in the terminal, then come back to this chat.`,
 		});
 	}
 
@@ -1148,10 +1357,9 @@ class ClaudeChatProvider {
 				console.log(`Created MCP config directory at: ${mcpConfigDir}`);
 			}
 
-			// Create or update mcp-servers.json with permissions server, preserving existing servers
+			// Create or update mcp-servers.json, preserving user's custom servers
+			// Note: Permissions are now handled via stdio, not MCP
 			const mcpConfigPath = path.join(mcpConfigDir, 'mcp-servers.json');
-			const mcpPermissionsPath = this.convertToWSLPath(path.join(this._extensionUri.fsPath, 'mcp-permissions.js'));
-			const permissionRequestsPath = this.convertToWSLPath(path.join(storagePath, 'permission-requests'));
 
 			// Load existing config or create new one
 			let mcpConfig: any = { mcpServers: {} };
@@ -1170,14 +1378,11 @@ class ClaudeChatProvider {
 				mcpConfig.mcpServers = {};
 			}
 
-			// Add or update the permissions server entry
-			mcpConfig.mcpServers['claude-code-chat-permissions'] = {
-				command: 'node',
-				args: [mcpPermissionsPath],
-				env: {
-					CLAUDE_PERMISSIONS_PATH: permissionRequestsPath
-				}
-			};
+			// Remove old permissions server if it exists (migrating from file-based to stdio)
+			if (mcpConfig.mcpServers['claude-code-chat-permissions']) {
+				delete mcpConfig.mcpServers['claude-code-chat-permissions'];
+				console.log('Removed legacy permissions MCP server (now using stdio)');
+			}
 
 			const configContent = new TextEncoder().encode(JSON.stringify(mcpConfig, null, 2));
 			await vscode.workspace.fs.writeFile(mcpConfigUri, configContent);
@@ -1188,180 +1393,325 @@ class ClaudeChatProvider {
 		}
 	}
 
-	private async _initializePermissions(): Promise<void> {
+	/**
+	 * Check if a tool is pre-approved in local permissions
+	 */
+	private async _isToolPreApproved(toolName: string, input: Record<string, unknown>): Promise<boolean> {
 		try {
-
-			if (this._permissionWatcher) {
-				this._permissionWatcher.dispose();
-				this._permissionWatcher = undefined;
-			}
-
 			const storagePath = this._context.storageUri?.fsPath;
-			if (!storagePath) { return; }
+			if (!storagePath) return false;
 
-			// Create permission requests directory
-			this._permissionRequestsPath = path.join(path.join(storagePath, 'permission-requests'));
-			try {
-				await vscode.workspace.fs.stat(vscode.Uri.file(this._permissionRequestsPath));
-			} catch {
-				await vscode.workspace.fs.createDirectory(vscode.Uri.file(this._permissionRequestsPath));
-				console.log(`Created permission requests directory at: ${this._permissionRequestsPath}`);
-			}
-
-			console.log("DIRECTORY-----", this._permissionRequestsPath)
-
-			// Set up file watcher for *.request files
-			this._permissionWatcher = vscode.workspace.createFileSystemWatcher(
-				new vscode.RelativePattern(this._permissionRequestsPath, '*.request')
-			);
-
-			this._permissionWatcher.onDidCreate(async (uri) => {
-				// Only handle file scheme URIs, ignore vscode-userdata scheme
-				if (uri.scheme === 'file') {
-					await this._handlePermissionRequest(uri);
-				}
-			});
-
-			this._disposables.push(this._permissionWatcher);
-
-		} catch (error: any) {
-			console.error('Failed to initialize permissions:', error.message);
-		}
-	}
-
-	private async _handlePermissionRequest(requestUri: vscode.Uri): Promise<void> {
-		try {
-			// Read the request file
-			const content = await vscode.workspace.fs.readFile(requestUri);
-			const request = JSON.parse(new TextDecoder().decode(content));
-
-			// Show permission dialog
-			const approved = await this._showPermissionDialog(request);
-
-			// Write response file
-			const responseFile = requestUri.fsPath.replace('.request', '.response');
-			const response = {
-				id: request.id,
-				approved: approved,
-				timestamp: new Date().toISOString()
-			};
-
-			const responseContent = new TextEncoder().encode(JSON.stringify(response));
-			await vscode.workspace.fs.writeFile(vscode.Uri.file(responseFile), responseContent);
-
-			// Clean up request file
-			await vscode.workspace.fs.delete(requestUri);
-
-		} catch (error: any) {
-			console.error('Failed to handle permission request:', error.message);
-		}
-	}
-
-	private async _showPermissionDialog(request: any): Promise<boolean> {
-		const toolName = request.tool || 'Unknown Tool';
-
-		// Generate pattern for Bash commands
-		let pattern = undefined;
-		if (toolName === 'Bash' && request.input?.command) {
-			pattern = this.getCommandPattern(request.input.command);
-		}
-
-		// Send permission request to the UI
-		this._sendAndSaveMessage({
-			type: 'permissionRequest',
-			data: {
-				id: request.id,
-				tool: toolName,
-				input: request.input,
-				pattern: pattern
-			}
-		});
-
-		// Wait for response from UI
-		return new Promise((resolve) => {
-			// Store the resolver so we can call it when we get the response
-			this._pendingPermissionResolvers = this._pendingPermissionResolvers || new Map();
-			this._pendingPermissionResolvers.set(request.id, resolve);
-		});
-	}
-
-	private _handlePermissionResponse(id: string, approved: boolean, alwaysAllow?: boolean): void {
-		if (this._pendingPermissionResolvers && this._pendingPermissionResolvers.has(id)) {
-			const resolver = this._pendingPermissionResolvers.get(id);
-			if (resolver) {
-				resolver(approved);
-				this._pendingPermissionResolvers.delete(id);
-
-				// Handle always allow setting
-				if (alwaysAllow && approved) {
-					void this._saveAlwaysAllowPermission(id);
-				}
-			}
-		}
-	}
-
-	private async _saveAlwaysAllowPermission(requestId: string): Promise<void> {
-		try {
-			// Read the original request to get tool name and input
-			const storagePath = this._context.storageUri?.fsPath;
-			if (!storagePath) return;
-
-			const requestFileUri = vscode.Uri.file(path.join(storagePath, 'permission-requests', `${requestId}.request`));
-
-			let requestContent: Uint8Array;
-			try {
-				requestContent = await vscode.workspace.fs.readFile(requestFileUri);
-			} catch {
-				return; // Request file doesn't exist
-			}
-
-			const request = JSON.parse(new TextDecoder().decode(requestContent));
-
-			// Load existing workspace permissions
-			const permissionsUri = vscode.Uri.file(path.join(storagePath, 'permission-requests', 'permissions.json'));
+			const permissionsUri = vscode.Uri.file(path.join(storagePath, 'permissions', 'permissions.json'));
 			let permissions: any = { alwaysAllow: {} };
 
 			try {
 				const content = await vscode.workspace.fs.readFile(permissionsUri);
 				permissions = JSON.parse(new TextDecoder().decode(content));
 			} catch {
-				// File doesn't exist yet, use default permissions
+				return false; // No permissions file
 			}
 
-			// Add the new permission
-			const toolName = request.tool;
-			if (toolName === 'Bash' && request.input?.command) {
-				// For Bash, store the command pattern
+			const toolPermission = permissions.alwaysAllow?.[toolName];
+
+			if (toolPermission === true) {
+				// Tool is fully approved (all commands/inputs)
+				return true;
+			}
+
+			if (Array.isArray(toolPermission) && toolName === 'Bash' && input.command) {
+				// Check if the command matches any approved pattern
+				const command = (input.command as string).trim();
+				for (const pattern of toolPermission) {
+					if (this._matchesPattern(command, pattern)) {
+						return true;
+					}
+				}
+			}
+
+			return false;
+		} catch (error) {
+			console.error('Error checking pre-approved permissions:', error);
+			return false;
+		}
+	}
+
+	/**
+	 * Check if a command matches a permission pattern (supports * wildcard)
+	 */
+	private _matchesPattern(command: string, pattern: string): boolean {
+		if (pattern === command) return true;
+
+		// Handle wildcard patterns like "npm install *"
+		if (pattern.endsWith(' *')) {
+			const prefix = pattern.slice(0, -1); // Remove the *
+			return command.startsWith(prefix);
+		}
+
+		// Handle exact match patterns
+		return false;
+	}
+
+	/**
+	 * Handle control_response messages from Claude CLI via stdio
+	 * This is used to get account info from the initialize request
+	 */
+	private _handleControlResponse(controlResponse: any): void {
+		// Structure: controlResponse.response.response.account
+		// The outer response has subtype/request_id, inner response has the actual data
+		const innerResponse = controlResponse.response?.response;
+
+		// Check if this is an initialize response with account info
+		if (innerResponse?.account) {
+			const account = innerResponse.account;
+			this._subscriptionType = account.subscriptionType;
+
+			console.log('Account info received:', {
+				subscriptionType: account.subscriptionType,
+				email: account.email
+			});
+
+			// Save to globalState for persistence
+			this._context.globalState.update('claude.subscriptionType', this._subscriptionType);
+
+			// Send subscription type to UI
+			this._postMessage({
+				type: 'accountInfo',
+				data: {
+					subscriptionType: this._subscriptionType
+				}
+			});
+		}
+	}
+
+	/**
+	 * Handle control_request messages from Claude CLI via stdio
+	 * This is the new permission flow that replaces the MCP file-based approach
+	 */
+	private async _handleControlRequest(controlRequest: any, claudeProcess: cp.ChildProcess): Promise<void> {
+		const request = controlRequest.request;
+		const requestId = controlRequest.request_id;
+
+		// Only handle can_use_tool requests (permission requests)
+		if (request?.subtype !== 'can_use_tool') {
+			console.log('Ignoring non-permission control request:', request?.subtype);
+			return;
+		}
+
+		const toolName = request.tool_name || 'Unknown Tool';
+		const input = request.input || {};
+		const suggestions = request.permission_suggestions;
+		const toolUseId = request.tool_use_id;
+
+		console.log(`Permission request for tool: ${toolName}, requestId: ${requestId}`);
+
+		// Check if this tool is pre-approved
+		const isPreApproved = await this._isToolPreApproved(toolName, input);
+
+		if (isPreApproved) {
+			console.log(`Tool ${toolName} is pre-approved, auto-allowing`);
+			// Auto-approve without showing UI
+			this._sendPermissionResponse(requestId, true, {
+				requestId,
+				toolName,
+				input,
+				suggestions,
+				toolUseId
+			}, false);
+			return;
+		}
+
+		// Store the request data so we can respond later
+		this._pendingPermissionRequests.set(requestId, {
+			requestId,
+			toolName,
+			input,
+			suggestions,
+			toolUseId
+		});
+
+		// Generate pattern for Bash commands (for display purposes)
+		let pattern: string | undefined;
+		if (toolName === 'Bash' && input.command) {
+			pattern = this.getCommandPattern(input.command as string);
+		}
+
+		// Send permission request to the UI with pending status
+		this._sendAndSaveMessage({
+			type: 'permissionRequest',
+			data: {
+				id: requestId,
+				tool: toolName,
+				input: input,
+				pattern: pattern,
+				suggestions: suggestions,
+				decisionReason: request.decision_reason,
+				blockedPath: request.blocked_path,
+				status: 'pending'
+			}
+		});
+	}
+
+	/**
+	 * Send permission response back to Claude CLI via stdin
+	 */
+	private _sendPermissionResponse(
+		requestId: string,
+		approved: boolean,
+		pendingRequest: {
+			requestId: string;
+			toolName: string;
+			input: Record<string, unknown>;
+			suggestions?: any[];
+			toolUseId: string;
+		},
+		alwaysAllow?: boolean
+	): void {
+		if (!this._currentClaudeProcess?.stdin || this._currentClaudeProcess.stdin.destroyed) {
+			console.error('Cannot send permission response: stdin not available');
+			return;
+		}
+
+		let response: any;
+		if (approved) {
+			response = {
+				type: 'control_response',
+				response: {
+					subtype: 'success',
+					request_id: requestId,
+					response: {
+						behavior: 'allow',
+						updatedInput: pendingRequest.input,
+						// Pass back suggestions if user chose "always allow"
+						updatedPermissions: alwaysAllow ? pendingRequest.suggestions : undefined,
+						toolUseID: pendingRequest.toolUseId
+					}
+				}
+			};
+		} else {
+			response = {
+				type: 'control_response',
+				response: {
+					subtype: 'success',
+					request_id: requestId,
+					response: {
+						behavior: 'deny',
+						message: 'User denied permission',
+						interrupt: true,
+						toolUseID: pendingRequest.toolUseId
+					}
+				}
+			};
+		}
+
+		const responseJson = JSON.stringify(response) + '\n';
+		console.log('Sending permission response:', responseJson);
+		console.log('Always allow:', alwaysAllow, 'Suggestions included:', !!pendingRequest.suggestions);
+		this._currentClaudeProcess.stdin.write(responseJson);
+	}
+
+	private async _initializePermissions(): Promise<void> {
+		// No longer needed - permissions are handled via stdio
+		// This method is kept for compatibility but does nothing
+	}
+
+	/**
+	 * Handle permission response from webview UI
+	 * Sends control_response back to Claude CLI via stdin
+	 */
+	private _handlePermissionResponse(id: string, approved: boolean, alwaysAllow?: boolean): void {
+		const pendingRequest = this._pendingPermissionRequests.get(id);
+		if (!pendingRequest) {
+			console.error('No pending permission request found for id:', id);
+			return;
+		}
+
+		// Remove from pending requests
+		this._pendingPermissionRequests.delete(id);
+
+		// Send the response to Claude via stdin
+		this._sendPermissionResponse(id, approved, pendingRequest, alwaysAllow);
+
+		// Update the permission request status in UI
+		this._postMessage({
+			type: 'updatePermissionStatus',
+			data: {
+				id: id,
+				status: approved ? 'approved' : 'denied'
+			}
+		});
+
+		// Also save to local permissions.json for UI display purposes
+		if (alwaysAllow && approved) {
+			void this._saveLocalPermission(pendingRequest.toolName, pendingRequest.input);
+		}
+	}
+
+	/**
+	 * Cancel all pending permission requests (called when process ends)
+	 */
+	private _cancelPendingPermissionRequests(): void {
+		for (const [id, _request] of this._pendingPermissionRequests) {
+			this._postMessage({
+				type: 'updatePermissionStatus',
+				data: {
+					id: id,
+					status: 'cancelled'
+				}
+			});
+		}
+		this._pendingPermissionRequests.clear();
+	}
+
+	/**
+	 * Save permission to local storage for UI display in settings
+	 * Note: The actual "always allow" is handled by Claude via updatedPermissions
+	 */
+	private async _saveLocalPermission(toolName: string, input: Record<string, unknown>): Promise<void> {
+		try {
+			const storagePath = this._context.storageUri?.fsPath;
+			if (!storagePath) return;
+
+			// Ensure permissions directory exists
+			const permissionsDir = path.join(storagePath, 'permissions');
+			try {
+				await vscode.workspace.fs.stat(vscode.Uri.file(permissionsDir));
+			} catch {
+				await vscode.workspace.fs.createDirectory(vscode.Uri.file(permissionsDir));
+			}
+
+			// Load existing permissions
+			const permissionsUri = vscode.Uri.file(path.join(permissionsDir, 'permissions.json'));
+			let permissions: any = { alwaysAllow: {} };
+
+			try {
+				const content = await vscode.workspace.fs.readFile(permissionsUri);
+				permissions = JSON.parse(new TextDecoder().decode(content));
+			} catch {
+				// File doesn't exist yet
+			}
+
+			// Add the permission
+			if (toolName === 'Bash' && input.command) {
 				if (!permissions.alwaysAllow[toolName]) {
 					permissions.alwaysAllow[toolName] = [];
 				}
 				if (Array.isArray(permissions.alwaysAllow[toolName])) {
-					const command = request.input.command.trim();
-					const pattern = this.getCommandPattern(command);
+					const pattern = this.getCommandPattern(input.command as string);
 					if (!permissions.alwaysAllow[toolName].includes(pattern)) {
 						permissions.alwaysAllow[toolName].push(pattern);
 					}
 				}
 			} else {
-				// For other tools, allow all instances
 				permissions.alwaysAllow[toolName] = true;
 			}
 
-			// Ensure permissions directory exists
-			const permissionsDir = vscode.Uri.file(path.dirname(permissionsUri.fsPath));
-			try {
-				await vscode.workspace.fs.stat(permissionsDir);
-			} catch {
-				await vscode.workspace.fs.createDirectory(permissionsDir);
-			}
-
-			// Save the permissions
+			// Save permissions
 			const permissionsContent = new TextEncoder().encode(JSON.stringify(permissions, null, 2));
 			await vscode.workspace.fs.writeFile(permissionsUri, permissionsContent);
 
-			console.log(`Saved always-allow permission for ${toolName}`);
+			console.log(`Saved local permission for ${toolName}`);
 		} catch (error) {
-			console.error('Error saving always-allow permission:', error);
+			console.error('Error saving local permission:', error);
 		}
 	}
 
@@ -1470,7 +1820,7 @@ class ClaudeChatProvider {
 				return;
 			}
 
-			const permissionsUri = vscode.Uri.file(path.join(storagePath, 'permission-requests', 'permissions.json'));
+			const permissionsUri = vscode.Uri.file(path.join(storagePath, 'permissions', 'permissions.json'));
 			let permissions: any = { alwaysAllow: {} };
 
 			try {
@@ -1498,7 +1848,7 @@ class ClaudeChatProvider {
 			const storagePath = this._context.storageUri?.fsPath;
 			if (!storagePath) return;
 
-			const permissionsUri = vscode.Uri.file(path.join(storagePath, 'permission-requests', 'permissions.json'));
+			const permissionsUri = vscode.Uri.file(path.join(storagePath, 'permissions', 'permissions.json'));
 			let permissions: any = { alwaysAllow: {} };
 
 			try {
@@ -1544,7 +1894,7 @@ class ClaudeChatProvider {
 			const storagePath = this._context.storageUri?.fsPath;
 			if (!storagePath) return;
 
-			const permissionsUri = vscode.Uri.file(path.join(storagePath, 'permission-requests', 'permissions.json'));
+			const permissionsUri = vscode.Uri.file(path.join(storagePath, 'permissions', 'permissions.json'));
 			let permissions: any = { alwaysAllow: {} };
 
 			try {
@@ -1815,14 +2165,30 @@ class ClaudeChatProvider {
 			this._conversationStartTime = new Date().toISOString();
 		}
 
+		// The message index will be the current length (0-indexed position after push)
+		const messageIndex = this._currentConversation.length;
+
+		// For tool messages that support diff, include the message index
+		const messageToSend = (message.type === 'toolUse' || message.type === 'toolResult')
+			? { ...message, data: { ...message.data, messageIndex } }
+			: message;
+
 		// Send to UI using the helper method
-		this._postMessage(message);
+		this._postMessage(messageToSend);
+
+		// Strip fileContentBefore/fileContentAfter from saved data to reduce storage
+		// Keep startLine/startLines which are small and needed for accurate line numbers on reload
+		let dataToSave = message.data;
+		if (message.type === 'toolUse' || message.type === 'toolResult') {
+			const { fileContentBefore, fileContentAfter, ...rest } = message.data || {};
+			dataToSave = rest; // startLine and startLines are preserved in rest
+		}
 
 		// Save to conversation
 		this._currentConversation.push({
 			timestamp: new Date().toISOString(),
 			messageType: message.type,
-			data: message.data
+			data: dataToSave
 		});
 
 		// Persist conversation
@@ -1968,10 +2334,88 @@ class ClaudeChatProvider {
 		}
 	}
 
-	private _stopClaudeProcess(): void {
+	private async _killProcessGroup(pid: number, signal: string = 'SIGTERM'): Promise<void> {
+		if (this._isWslProcess) {
+			// WSL: Kill processes inside WSL using pkill
+			// The Windows PID won't work inside WSL, so we kill by name
+			try {
+				// Kill all node/claude processes started by this session inside WSL
+				const killSignal = signal === 'SIGKILL' ? '-9' : '-15';
+				await exec(`wsl -d ${this._wslDistro} pkill ${killSignal} -f "claude"`);
+			} catch {
+				// Process may already be dead or pkill not available
+			}
+			// Also kill the Windows-side wsl process
+			try {
+				await exec(`taskkill /pid ${pid} /t /f`);
+			} catch {
+				// Process may already be dead
+			}
+		} else if (process.platform === 'win32') {
+			// Windows: Use taskkill with /T flag for tree kill
+			try {
+				await exec(`taskkill /pid ${pid} /t /f`);
+			} catch {
+				// Process may already be dead
+			}
+		} else {
+			// Unix: Kill process group with negative PID
+			try {
+				process.kill(-pid, signal as NodeJS.Signals);
+			} catch {
+				// Process may already be dead
+			}
+		}
+	}
+
+	private async _killClaudeProcess(): Promise<void> {
+		const processToKill = this._currentClaudeProcess;
+		const pid = processToKill?.pid;
+
+		// 1. Abort via controller (clean API)
+		this._abortController?.abort();
+		this._abortController = undefined;
+
+		// 2. Clear reference immediately
+		this._currentClaudeProcess = undefined;
+
+		if (!pid) {
+			return;
+		}
+
+		console.log(`Terminating Claude process group (PID: ${pid})...`);
+
+		// 3. Kill process group (handles children)
+		await this._killProcessGroup(pid, 'SIGTERM');
+
+		// 4. Wait for process to exit, with timeout
+		const exitPromise = new Promise<void>((resolve) => {
+			if (processToKill?.killed) {
+				resolve();
+				return;
+			}
+			processToKill?.once('exit', () => resolve());
+		});
+
+		const timeoutPromise = new Promise<void>((resolve) => {
+			setTimeout(() => resolve(), 2000);
+		});
+
+		await Promise.race([exitPromise, timeoutPromise]);
+
+		// 5. Force kill if still running
+		if (processToKill && !processToKill.killed) {
+			console.log(`Force killing Claude process group (PID: ${pid})...`);
+			await this._killProcessGroup(pid, 'SIGKILL');
+		}
+
+		console.log('Claude process group terminated');
+	}
+
+	private async _stopClaudeProcess(): Promise<void> {
 		console.log('Stop request received');
 
-		this._isProcessing = false
+		this._isProcessing = false;
 
 		// Update UI state
 		this._postMessage({
@@ -1979,37 +2423,17 @@ class ClaudeChatProvider {
 			data: { isProcessing: false }
 		});
 
-		if (this._currentClaudeProcess) {
-			console.log('Terminating Claude process...');
+		await this._killClaudeProcess();
 
-			// Try graceful termination first
-			this._currentClaudeProcess.kill('SIGTERM');
+		this._postMessage({
+			type: 'clearLoading'
+		});
 
-			// Force kill after 2 seconds if still running
-			setTimeout(() => {
-				if (this._currentClaudeProcess && !this._currentClaudeProcess.killed) {
-					console.log('Force killing Claude process...');
-					this._currentClaudeProcess.kill('SIGKILL');
-				}
-			}, 2000);
-
-			// Clear process reference
-			this._currentClaudeProcess = undefined;
-
-			this._postMessage({
-				type: 'clearLoading'
-			});
-
-			// Send stop confirmation message directly to UI and save
-			this._sendAndSaveMessage({
-				type: 'error',
-				data: '⏹️ Claude code was stopped.'
-			});
-
-			console.log('Claude process termination initiated');
-		} else {
-			console.log('No Claude process running to stop');
-		}
+		// Send stop confirmation message directly to UI and save
+		this._sendAndSaveMessage({
+			type: 'error',
+			data: '⏹️ Claude code was stopped.'
+		});
 	}
 
 	private _updateConversationIndex(filename: string, conversationData: ConversationData): void {
@@ -2096,9 +2520,22 @@ class ClaudeChatProvider {
 							}
 						}
 
+						// For tool messages, include the message index so Open Diff buttons work
+						let messageData = (message.messageType === 'toolUse' || message.messageType === 'toolResult')
+							? { ...message.data, messageIndex: i }
+							: message.data;
+
+						// For permission requests loaded from history, mark pending ones as expired
+						// ONLY if there's no active Claude process (i.e., VS Code was restarted)
+						if (message.messageType === 'permissionRequest' &&
+							message.data?.status === 'pending' &&
+							!this._currentClaudeProcess) {
+							messageData = { ...message.data, status: 'expired' };
+						}
+
 						this._postMessage({
 							type: message.messageType,
-							data: message.data
+							data: messageData
 						});
 						if (message.messageType === 'userInput') {
 							try {
@@ -2127,6 +2564,15 @@ class ClaudeChatProvider {
 							data: { isProcessing: this._isProcessing, requestStartTime }
 						});
 					}
+
+					// Mark any pending permission requests as expired ONLY if there's no active Claude process
+					// (i.e., VS Code was restarted, not just the panel was closed/reopened)
+					if (!this._currentClaudeProcess) {
+						this._postMessage({
+							type: 'expirePendingPermissions'
+						});
+					}
+
 					// Send ready message after conversation is loaded
 					this._sendReadyMessage();
 				}, 50);
@@ -2345,7 +2791,10 @@ class ClaudeChatProvider {
 		}
 
 		// Create terminal with the claude /model command
-		const terminal = vscode.window.createTerminal('Claude Model Selection');
+		const terminal = vscode.window.createTerminal({
+			name: 'Claude Model Selection',
+			location: { viewColumn: vscode.ViewColumn.One }
+		});
 		if (wslEnabled) {
 			terminal.sendText(`wsl -d ${wslDistro} ${nodePath} --no-warnings --enable-source-maps ${claudePath} ${args.join(' ')}`);
 		} else {
@@ -2366,7 +2815,84 @@ class ClaudeChatProvider {
 		});
 	}
 
+	private _openUsageTerminal(usageType: string): void {
+		// Get WSL configuration
+		const config = vscode.workspace.getConfiguration('claudeCodeChat');
+		const wslEnabled = config.get<boolean>('wsl.enabled', false);
+		const wslDistro = config.get<string>('wsl.distro', 'Ubuntu');
+
+		const terminal = vscode.window.createTerminal({
+			name: 'Claude Usage',
+			location: { viewColumn: vscode.ViewColumn.One }
+		});
+
+		let command: string;
+		if (usageType === 'plan') {
+			// Plan users get live usage view
+			command = 'npx -y ccusage blocks --live';
+		} else {
+			// API users get recent usage history
+			command = 'npx -y ccusage blocks --recent --order desc';
+		}
+
+		if (wslEnabled) {
+			terminal.sendText(`wsl -d ${wslDistro} bash -ic "${command}"`);
+		} else {
+			terminal.sendText(command);
+		}
+
+		terminal.show();
+	}
+
+	private _runInstallCommand(): void {
+		const { exec } = require('child_process');
+
+		// Check if npm exists and node >= 18
+		exec('node --version', { shell: true }, (nodeErr: Error | null, nodeStdout: string) => {
+			let useNpm = false;
+
+			if (!nodeErr && nodeStdout) {
+				// Parse version (e.g., "v18.17.0" -> 18)
+				const match = nodeStdout.trim().match(/^v(\d+)/);
+				if (match && parseInt(match[1], 10) >= 18) {
+					useNpm = true;
+				}
+			}
+
+			let command: string;
+			if (useNpm) {
+				command = 'npm install -g @anthropic-ai/claude-code';
+			} else if (process.platform === 'win32') {
+				command = 'irm https://claude.ai/install.ps1 | iex';
+			} else {
+				command = 'curl -fsSL https://claude.ai/install.sh | sh';
+			}
+
+			// Run installation silently in the background
+			exec(command, { shell: true }, (error: Error | null, stdout: string, stderr: string) => {
+				if (error) {
+					this._postMessage({
+						type: 'installComplete',
+						success: false,
+						error: stderr || error.message
+					});
+				} else {
+					this._postMessage({
+						type: 'installComplete',
+						success: true
+					});
+				}
+			});
+		});
+	}
+
 	private _executeSlashCommand(command: string): void {
+		// Handle /compact in chat instead of spawning a terminal
+		if (command === 'compact') {
+			this._sendMessageToClaude(`/${command}`);
+			return;
+		}
+
 		const config = vscode.workspace.getConfiguration('claudeCodeChat');
 		const wslEnabled = config.get<boolean>('wsl.enabled', false);
 		const wslDistro = config.get<string>('wsl.distro', 'Ubuntu');
@@ -2382,7 +2908,10 @@ class ClaudeChatProvider {
 		}
 
 		// Create terminal with the claude command
-		const terminal = vscode.window.createTerminal(`Claude /${command}`);
+		const terminal = vscode.window.createTerminal({
+			name: `Claude /${command}`,
+			location: { viewColumn: vscode.ViewColumn.One }
+		});
 		if (wslEnabled) {
 			terminal.sendText(`wsl -d ${wslDistro} ${nodePath} --no-warnings --enable-source-maps ${claudePath} ${args.join(' ')}`);
 		} else {
@@ -2434,6 +2963,109 @@ class ClaudeChatProvider {
 		} catch (error) {
 			vscode.window.showErrorMessage(`Failed to open file: ${filePath}`);
 			console.error('Error opening file:', error);
+		}
+	}
+
+	private async _openDiffByMessageIndex(messageIndex: number) {
+		try {
+			const message = this._currentConversation[messageIndex];
+			if (!message) {
+				console.error('Message not found at index:', messageIndex);
+				return;
+			}
+
+			const data = message.data;
+			const toolName = data.toolName;
+			const rawInput = data.rawInput;
+			let filePath = rawInput?.file_path || '';
+			let oldContent = '';
+			let newContent = '';
+
+			if (!filePath) {
+				console.error('No file path found for message at index:', messageIndex);
+				return;
+			}
+
+			// Read current file from disk - this is the "before" state since edit hasn't been applied yet
+			try {
+				const fileUri = vscode.Uri.file(filePath);
+				const fileData = await vscode.workspace.fs.readFile(fileUri);
+				oldContent = Buffer.from(fileData).toString('utf8');
+			} catch {
+				// File might not exist yet (for Write creating new file)
+				oldContent = '';
+			}
+
+			// Compute "after" state by applying the edit to current file
+			if (toolName === 'Edit' && rawInput?.old_string && rawInput?.new_string) {
+				newContent = oldContent.replace(rawInput.old_string, rawInput.new_string);
+			} else if (toolName === 'MultiEdit' && rawInput?.edits) {
+				newContent = oldContent;
+				for (const edit of rawInput.edits) {
+					if (edit.old_string && edit.new_string) {
+						newContent = newContent.replace(edit.old_string, edit.new_string);
+					}
+				}
+			} else if (toolName === 'Write' && rawInput?.content) {
+				newContent = rawInput.content;
+			}
+
+			if (oldContent !== newContent) {
+				await this._openDiffEditor(oldContent, newContent, filePath);
+			} else {
+				vscode.window.showInformationMessage('No changes to show - the edit may have already been applied.');
+			}
+		} catch (error) {
+			console.error('Error opening diff by message index:', error);
+		}
+	}
+
+	private async _openDiffEditor(oldContent: string, newContent: string, filePath: string) {
+		try {
+			// oldContent and newContent are now full file contents passed from the webview
+			const baseName = path.basename(filePath);
+			const timestamp = Date.now();
+
+			// Create unique paths for the virtual documents
+			const oldPath = `/${timestamp}/old/${baseName}`;
+			const newPath = `/${timestamp}/new/${baseName}`;
+
+			// Store content in the global store for the content provider
+			diffContentStore.set(oldPath, oldContent);
+			diffContentStore.set(newPath, newContent);
+
+			// Create URIs with our custom scheme
+			const oldUri = vscode.Uri.parse(`claude-diff:${oldPath}`);
+			const newUri = vscode.Uri.parse(`claude-diff:${newPath}`);
+
+			// Ensure side-by-side diff mode is enabled
+			const diffConfig = vscode.workspace.getConfiguration('diffEditor');
+			const wasInlineMode = diffConfig.get('renderSideBySide') === false;
+			if (wasInlineMode) {
+				await diffConfig.update('renderSideBySide', true, vscode.ConfigurationTarget.Global);
+			}
+
+			// Open diff editor
+			await vscode.commands.executeCommand('vscode.diff', oldUri, newUri, `${baseName} (Changes)`);
+
+			// Clean up stored content when documents are closed
+			const closeListener = vscode.workspace.onDidCloseTextDocument((doc) => {
+				if (doc.uri.toString() === oldUri.toString()) {
+					diffContentStore.delete(oldPath);
+				}
+				if (doc.uri.toString() === newUri.toString()) {
+					diffContentStore.delete(newPath);
+				}
+				// Dispose listener when both are cleaned up
+				if (!diffContentStore.has(oldPath) && !diffContentStore.has(newPath)) {
+					closeListener.dispose();
+				}
+			});
+
+			this._disposables.push(closeListener);
+		} catch (error) {
+			vscode.window.showErrorMessage(`Failed to open diff editor: ${error}`);
+			console.error('Error opening diff editor:', error);
 		}
 	}
 
