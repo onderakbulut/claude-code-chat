@@ -192,7 +192,13 @@ class ClaudeChatProvider {
 		this._closeSidebar();
 
 		if (this._panel) {
-			this._panel.reveal(actualColumn);
+			// If panel is already visible, just reveal it without changing the column
+			// This prevents resizing the panel when it's already open
+			if (this._panel.visible) {
+				this._panel.reveal();
+			} else {
+				this._panel.reveal(actualColumn);
+			}
 			return;
 		}
 
